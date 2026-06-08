@@ -98,3 +98,17 @@ class SSEHandlerTests(unittest.TestCase):
         self.assertEqual(result.total_tokens, 10)
         self.assertEqual(result.model, "MiniMax-M3")
         self.assertEqual(result.request_id, "r1")
+
+    def test_reasoning_tokens_are_estimated_from_reasoning_deltas(self) -> None:
+        raw_iter = [
+            (
+                b'data: {"id":"r1","model":"MiniMax-M3","choices":[{"delta":{"reasoning_content":"plan"}}]}\n\n'
+                b'data: {"id":"r1","model":"MiniMax-M3","choices":[{"delta":{"content":"answer"}}]}\n\n'
+                b'data: {"id":"r1","model":"MiniMax-M3","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":10,"total_tokens":17}}\n\n'
+            )
+        ]
+
+        _, result = _consume(iter_sse_chunks(raw_iter))
+
+        self.assertEqual(result.completion_tokens, 10)
+        self.assertEqual(result.reasoning_tokens, 4)

@@ -1,4 +1,4 @@
-# Monitor：轻量 Token 网关
+# 轻量易用的 Token 网关
 
 `monitor` 是一个本地 Token 网关。它部署在客户端工具和上游大模型服务之间，向下游提供 OpenAI 兼容的 `chat/completions` 接口，同时把请求转发给真实模型服务商，并记录每次请求的 token 开销，实时呈现汇总数据。
 
@@ -38,12 +38,9 @@ monitor 本身不生成模型结果，只做三件事：
 在当前目录执行：
 
 ```shell
+# deepseek 官方服务
 python monitor --provider deepseek --model deepseek-v4-pro --api-key <API_KEY>
-```
-
-MiniMax 示例：
-
-```shell
+# minimax 官方服务
 python monitor --provider minimax --model MiniMax-M3 --api-key <API_KEY>
 ```
 
@@ -53,7 +50,42 @@ python monitor --provider minimax --model MiniMax-M3 --api-key <API_KEY>
 http://127.0.0.1:9100/v1/chat/completions
 ```
 
-停止服务时，在 monitor 终端按 `Ctrl+C`。停止后会输出本次运行的 token 汇总。
+停止服务时，在 monitor 终端按 `Ctrl+C`。
+
+## 查看 token 开销
+
+monitor 会把每次请求写入 JSONL 日志，默认文件是：
+
+```text
+token_usage.jsonl
+```
+
+每行是一条请求记录，包含：
+
+```json
+{
+  "request_id": "...",
+  "model": "MiniMax-M3",
+  "prompt_tokens": 183,
+  "completion_tokens": 32,
+  "total_tokens": 215,
+  "cached_tokens": 169,
+  "effective_prompt_tokens": 14,
+  "reasoning_tokens": 0,
+  "duration": 3.09,
+  "stream": true
+}
+```
+
+运行 monitor 的终端窗口中，会实时刷新显示 token 开销汇总数据，也可以离线查看汇总数据：
+
+```shell
+python monitor --summary token_usage.jsonl
+```
+
+<img width="2869" height="1910" alt="4d9db4f3c2d74213a925c2185ac04add" src="https://github.com/user-attachments/assets/21807482-e536-41a7-a4d0-3635d57be466" />
+
+
 
 ## 支持的服务商
 
@@ -98,37 +130,6 @@ Model: 任意字符串
 下游填写的 API Key 不会用于访问上游。monitor 使用启动命令中的 `--api-key` 调用真实模型服务。
 
 如果 monitor 启动时传了 `--model`，下游请求里的 `model` 会被覆盖。这样客户端可以固定写一个占位模型名，由 monitor 统一决定真实上游模型。
-
-## 查看 token 开销
-
-monitor 会把每次请求写入 JSONL 日志，默认文件是：
-
-```text
-token_usage.jsonl
-```
-
-每行是一条请求记录，包含：
-
-```json
-{
-  "request_id": "...",
-  "model": "MiniMax-M3",
-  "prompt_tokens": 183,
-  "completion_tokens": 32,
-  "total_tokens": 215,
-  "cached_tokens": 169,
-  "effective_prompt_tokens": 14,
-  "reasoning_tokens": 0,
-  "duration": 3.09,
-  "stream": true
-}
-```
-
-运行 monitor 的终端窗口中，会实时刷新显示 token 开销汇总数据，也可以离线查看汇总数据：
-
-```shell
-python monitor --summary token_usage.jsonl
-```
 
 ## 使用 test.py 验证
 

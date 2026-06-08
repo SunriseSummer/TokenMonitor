@@ -1,29 +1,22 @@
-"""
-上游服务商路由模块。
-
-负责将下游请求转发到上游 OpenAI 兼容接口，
-支持流式和非流式两种模式，确保 usage 信息完整返回。
-"""
+"""上游请求转发"""
 
 from __future__ import annotations
 
 import json
-import time
-import urllib.request
-import urllib.error
 import ssl
-from typing import Any
+import urllib.error
+import urllib.request
 
 from .config import MonitorConfig
-from .provider_adapters import (
-    iter_normalized_minimax_sse,
-    normalize_minimax_non_stream_response,
-)
+from .provider_adapters import adapter_for
 from .sse_handler import SSEResult, extract_usage_from_chunk
 
 
+TIMEOUT_SECONDS = 300
+
+
 def _build_ssl_context() -> ssl.SSLContext:
-    """构建不验证证书的 SSL 上下文（与 Coder 的 INSECURE_TLS 对齐）。"""
+    """构造宽松 TLS 上下文"""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -31,69 +24,97 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 
 def prepare_request_body(body: dict) -> dict:
-    """修改请求体以确保上游返回 usage 信息。
-
-    对于流式请求，注入 stream_options.include_usage = true，
-    让上游在最后一个 SSE chunk 中附带完整的 usage 数据。
-    """
+    """准备上游请求体"""
     result = dict(body)
     if result.get("stream", False):
-        opts = result.get("stream_options") or {}
-        opts["include_usage"] = True
-        result["stream_options"] = opts
+        options = result.get("stream_options") or {}
+        options["include_usage"] = True
+        result["stream_options"] = options
     return result
 
 
-def forward_non_stream(
-    config: MonitorConfig, body: dict, headers: dict[str, str]
-) -> tuple[int, dict[str, str], bytes, SSEResult]:
-    """非流式转发：发送请求并解析完整响应。"""
-    endpoint = config.resolve_endpoint()
-    payload = json.dumps(prepare_request_body(body)).encode("utf-8")
-
+def _build_request(
+    config: MonitorConfig,
+    body: dict,
+    *,
+    accept: str,
+) -> urllib.request.Request:
+    payload = json.dumps(prepare_request_body(body), ensure_ascii=False).encode(
+        "utf-8"
+    )
     req = urllib.request.Request(
-        endpoint, data=payload, method="POST"
+        config.resolve_endpoint(),
+        data=payload,
+        method="POST",
     )
     req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
+    req.add_header("Accept", accept)
     req.add_header("Authorization", f"Bearer {config.upstream_api_key}")
+    return req
 
-    ssl_ctx = _build_ssl_context()
+
+def _extract_result(data: dict) -> SSEResult:
+    result = SSEResult()
+    usage = extract_usage_from_chunk(data)
+    if usage:
+        result.prompt_tokens = usage["prompt_tokens"]
+        result.completion_tokens = usage["completion_tokens"]
+        result.total_tokens = usage["total_tokens"]
+        result.cached_tokens = usage.get("cached_tokens", 0)
+        result.reasoning_tokens = usage.get("reasoning_tokens", 0)
+    result.model = data.get("model", "")
+    result.request_id = data.get("id", "")
+    return result
+
+
+def _line_iter(resp):
+    """按行读取上游 SSE 响应"""
+    buffer = b""
+    while True:
+        chunk = resp.read(4096)
+        if not chunk:
+            if buffer:
+                yield buffer
+            return
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            yield line + b"\n"
+
+
+def forward_non_stream(
+    config: MonitorConfig,
+    body: dict,
+    headers: dict[str, str],
+) -> tuple[int, dict[str, str], bytes, SSEResult]:
+    """转发非流式请求"""
+    req = _build_request(config, body, accept="application/json")
+    adapter = adapter_for(config.upstream_provider)
     result = SSEResult()
 
     try:
-        with urllib.request.urlopen(req, context=ssl_ctx,
-                                    timeout=300) as resp:
-            resp_body = resp.read()
-            resp_headers = dict(resp.headers)
+        with urllib.request.urlopen(
+            req,
+            context=_build_ssl_context(),
+            timeout=TIMEOUT_SECONDS,
+        ) as resp:
             status = resp.status
-    except urllib.error.HTTPError as e:
-        resp_body = e.read()
-        resp_headers = dict(e.headers)
-        status = e.code
+            resp_headers = dict(resp.headers)
+            resp_body = resp.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        resp_headers = dict(exc.headers)
+        resp_body = exc.read()
 
-    # 解析 usage
     if status < 400:
         try:
-            data = json.loads(resp_body)
-            if config.upstream_provider == "minimax":
-                data = normalize_minimax_non_stream_response(data)
-                resp_body = json.dumps(
-                    data,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            usage_info = extract_usage_from_chunk(data)
-            if usage_info:
-                result.prompt_tokens = usage_info["prompt_tokens"]
-                result.completion_tokens = usage_info["completion_tokens"]
-                result.total_tokens = usage_info["total_tokens"]
-                result.cached_tokens = usage_info.get("cached_tokens", 0)
-                result.reasoning_tokens = usage_info.get(
-                    "reasoning_tokens", 0
-                )
-            result.model = data.get("model", "")
-            result.request_id = data.get("id", "")
+            data = adapter.normalize_response(json.loads(resp_body))
+            resp_body = json.dumps(
+                data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            result = _extract_result(data)
         except (json.JSONDecodeError, KeyError):
             pass
 
@@ -101,53 +122,27 @@ def forward_non_stream(
 
 
 def forward_stream(
-    config: MonitorConfig, body: dict, headers: dict[str, str]
+    config: MonitorConfig,
+    body: dict,
+    headers: dict[str, str],
 ):
-    """流式转发：返回 (status, resp_headers, line_iterator, finalizer)。
-
-    line_iterator 产生原始字节行，供 proxy 层 SSE 解析和转发。
-    finalizer 是一个无参函数，调用后关闭上游连接。
-    """
-    endpoint = config.resolve_endpoint()
-    payload = json.dumps(prepare_request_body(body)).encode("utf-8")
-
-    req = urllib.request.Request(
-        endpoint, data=payload, method="POST"
-    )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "text/event-stream")
-    req.add_header("Authorization", f"Bearer {config.upstream_api_key}")
-
-    ssl_ctx = _build_ssl_context()
+    """转发流式请求"""
+    req = _build_request(config, body, accept="text/event-stream")
+    adapter = adapter_for(config.upstream_provider)
 
     try:
-        resp = urllib.request.urlopen(req, context=ssl_ctx, timeout=300)
-    except urllib.error.HTTPError as e:
-        error_body = e.read()
-        resp_headers = dict(e.headers)
+        resp = urllib.request.urlopen(
+            req,
+            context=_build_ssl_context(),
+            timeout=TIMEOUT_SECONDS,
+        )
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read()
 
-        def empty_iter():
+        def error_iter():
             yield error_body
-        return e.code, resp_headers, empty_iter(), lambda: None
 
-    resp_headers = dict(resp.headers)
+        return exc.code, dict(exc.headers), error_iter(), lambda: None
 
-    def line_iter():
-        """逐行读取上游 SSE 流。"""
-        buf = b""
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                if buf:
-                    yield buf
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                yield line + b"\n"
-
-    lines = line_iter()
-    if config.upstream_provider == "minimax":
-        lines = iter_normalized_minimax_sse(lines)
-
-    return resp.status, resp_headers, lines, lambda: resp.close()
+    lines = adapter.normalize_stream(_line_iter(resp))
+    return resp.status, dict(resp.headers), lines, lambda: resp.close()

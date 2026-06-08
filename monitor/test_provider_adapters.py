@@ -10,10 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from monitor.provider_adapters import (
-    iter_normalized_minimax_sse,
-    normalize_minimax_non_stream_response,
-)
+from monitor.provider_adapters import MiniMaxAdapter
 
 
 def _json_event(raw: bytes) -> dict:
@@ -23,8 +20,12 @@ def _json_event(raw: bytes) -> dict:
 
 
 class MiniMaxAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = MiniMaxAdapter()
+
     def test_non_stream_moves_think_tags_to_reasoning_content(self) -> None:
         data = {
+            "usage": {"completion_tokens": 10},
             "choices": [
                 {
                     "message": {
@@ -35,12 +36,16 @@ class MiniMaxAdapterTests(unittest.TestCase):
             ]
         }
 
-        normalized = normalize_minimax_non_stream_response(data)
+        normalized = self.adapter.normalize_response(data)
         message = normalized["choices"][0]["message"]
 
         self.assertEqual(message["reasoning_content"], "plan first")
         self.assertNotIn("<think>", message["content"])
         self.assertEqual(message["content"], "\n\nanswer")
+        self.assertGreater(
+            normalized["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0,
+        )
 
     def test_stream_moves_inline_think_tags_to_reasoning_delta(self) -> None:
         raw_iter = [
@@ -50,7 +55,7 @@ class MiniMaxAdapterTests(unittest.TestCase):
             b"\n",
         ]
 
-        chunks = list(iter_normalized_minimax_sse(raw_iter))
+        chunks = list(self.adapter.normalize_stream(raw_iter))
         data = _json_event(chunks[0])
         delta = data["choices"][0]["delta"]
 
@@ -72,7 +77,7 @@ class MiniMaxAdapterTests(unittest.TestCase):
 
         chunks = [
             _json_event(chunk)
-            for chunk in iter_normalized_minimax_sse(raw_iter)
+            for chunk in self.adapter.normalize_stream(raw_iter)
             if chunk != b"data: [DONE]\n\n"
         ]
         deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
@@ -90,7 +95,7 @@ class MiniMaxAdapterTests(unittest.TestCase):
             )
         ]
 
-        chunks = list(iter_normalized_minimax_sse(raw_iter))
+        chunks = list(self.adapter.normalize_stream(raw_iter))
         payloads = [_json_event(chunk) for chunk in chunks]
 
         self.assertEqual(

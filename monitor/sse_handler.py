@@ -1,22 +1,18 @@
-"""
-SSE（Server-Sent Events）流式响应处理模块。
-
-负责：
-  1. 逐行解析上游 SSE 数据流
-  2. 从最后一个 chunk 提取 usage 信息
-  3. 将数据透传给下游客户端
-"""
+"""SSE 透传与 usage 收集"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Generator
+
+from .provider_adapters import estimate_reasoning_tokens
+from .sse import encode_done, iter_events
 
 
 @dataclass
 class SSEResult:
-    """SSE 流处理结果，包含完整的 usage 数据。"""
+    """SSE 处理结果"""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -25,16 +21,6 @@ class SSEResult:
     reasoning_tokens: int = 0
     model: str = ""
     request_id: str = ""
-
-
-def parse_sse_line(line: str) -> str | None:
-    """解析单行 SSE 数据，返回 data 字段内容或 None。"""
-    stripped = line.strip()
-    if not stripped or stripped.startswith(":"):
-        return None
-    if stripped.startswith("data:"):
-        return stripped[5:].strip()
-    return None
 
 
 def _int_usage_value(value, default: int = 0) -> int:
@@ -46,45 +32,43 @@ def _int_usage_value(value, default: int = 0) -> int:
         return default
 
 
-def _iter_lines(raw_item):
-    if isinstance(raw_item, bytes):
-        lines = raw_item.splitlines(keepends=True)
-    else:
-        lines = str(raw_item).splitlines(keepends=True)
-    return lines or [raw_item]
+def _text_len(value) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            if isinstance(item, dict):
+                total += _text_len(item.get("text", ""))
+            else:
+                total += _text_len(item)
+        return total
+    return 0
 
 
 def extract_usage_from_chunk(data: dict) -> dict:
-    """从 SSE chunk 中提取 usage 信息。
-
-    OpenAI 兼容接口在 stream_options.include_usage=true 时，
-    最后一个 chunk 会包含完整的 usage 字段。
-    """
+    """从响应 chunk 中提取 usage"""
     usage = data.get("usage")
     if not usage:
         return {}
+
     result = {
         "prompt_tokens": _int_usage_value(usage.get("prompt_tokens")),
-        "completion_tokens": _int_usage_value(
-            usage.get("completion_tokens")
-        ),
+        "completion_tokens": _int_usage_value(usage.get("completion_tokens")),
         "total_tokens": _int_usage_value(usage.get("total_tokens")),
     }
-    # 提取 prompt_tokens_details 中的缓存 token
-    details = usage.get("prompt_tokens_details") or {}
+
+    prompt_details = usage.get("prompt_tokens_details") or {}
     result["cached_tokens"] = _int_usage_value(
-        details.get(
+        prompt_details.get(
             "cached_tokens",
-            usage.get(
-                "cached_tokens",
-                usage.get("prompt_cache_hit_tokens", 0),
-            ),
+            usage.get("cached_tokens", usage.get("prompt_cache_hit_tokens", 0)),
         )
     )
-    # 提取 completion_tokens_details 中的推理 token
-    comp_details = usage.get("completion_tokens_details") or {}
+
+    completion_details = usage.get("completion_tokens_details") or {}
     result["reasoning_tokens"] = _int_usage_value(
-        comp_details.get(
+        completion_details.get(
             "reasoning_tokens",
             usage.get("reasoning_tokens", 0),
         )
@@ -92,91 +76,66 @@ def extract_usage_from_chunk(data: dict) -> dict:
     return result
 
 
+class UsageCollector:
+    """从 SSE chunk 中累计 usage 和文本长度"""
+
+    def __init__(self) -> None:
+        self.result = SSEResult()
+        self.content_text_len = 0
+        self.reasoning_text_len = 0
+
+    def consume(self, data: dict) -> None:
+        self._collect_delta_text(data)
+        usage_info = extract_usage_from_chunk(data)
+        if usage_info:
+            self._apply_usage(data, usage_info)
+        if not self.result.model:
+            self.result.model = data.get("model", "")
+        if not self.result.request_id:
+            self.result.request_id = data.get("id", "")
+
+    def _collect_delta_text(self, data: dict) -> None:
+        for choice in data.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            self.content_text_len += _text_len(delta.get("content"))
+            self.reasoning_text_len += _text_len(delta.get("reasoning_content"))
+
+    def _apply_usage(self, data: dict, usage_info: dict) -> None:
+        if not usage_info.get("reasoning_tokens") and self.reasoning_text_len > 0:
+            usage_info["reasoning_tokens"] = estimate_reasoning_tokens(
+                usage_info["completion_tokens"],
+                self.reasoning_text_len,
+                self.content_text_len,
+            )
+        self.result.prompt_tokens = usage_info["prompt_tokens"]
+        self.result.completion_tokens = usage_info["completion_tokens"]
+        self.result.total_tokens = usage_info["total_tokens"]
+        self.result.cached_tokens = usage_info.get("cached_tokens", 0)
+        self.result.reasoning_tokens = usage_info.get("reasoning_tokens", 0)
+        self.result.model = data.get("model", self.result.model)
+        self.result.request_id = data.get("id", self.result.request_id)
+
+
 def iter_sse_chunks(
     raw_iter,
 ) -> Generator[tuple[bytes, dict | None], None, SSEResult]:
-    """迭代 SSE 数据流，透传原始字节并收集 usage。
-
-    Args:
-        raw_iter: 产生原始字节行的可迭代对象。
-
-    Yields:
-        (raw_bytes, parsed_data_or_None) 二元组。
-
-    Returns:
-        SSEResult 汇总。
-    """
-    result = SSEResult()
-    pending_event_lines: list[bytes] = []
-    pending_data_lines: list[str] = []
-
-    def finalize_event() -> Generator[tuple[bytes, dict | None], None, None]:
-        if not pending_event_lines and not pending_data_lines:
-            return
-
-        data_text = "\n".join(pending_data_lines)
-        event_bytes = b"".join(pending_event_lines) + b"\n"
-        pending_event_lines.clear()
-        pending_data_lines.clear()
-
-        if data_text.strip() == "[DONE]":
-            yield (b"data: [DONE]\n\n", None)
-            return
-
-        if data_text:
+    """透传 SSE 事件并在结束时返回 usage"""
+    collector = UsageCollector()
+    for event in iter_events(raw_iter):
+        if event.is_comment:
+            yield event.raw, None
+            continue
+        if event.is_done:
+            yield encode_done(), None
+            continue
+        if event.data:
             try:
-                data = json.loads(data_text)
-                usage_info = extract_usage_from_chunk(data)
-                if usage_info:
-                    result.prompt_tokens = usage_info["prompt_tokens"]
-                    result.completion_tokens = usage_info[
-                        "completion_tokens"
-                    ]
-                    result.total_tokens = usage_info["total_tokens"]
-                    result.cached_tokens = usage_info.get(
-                        "cached_tokens", 0
-                    )
-                    result.reasoning_tokens = usage_info.get(
-                        "reasoning_tokens", 0
-                    )
-                if not result.model:
-                    result.model = data.get("model", "")
-                if not result.request_id:
-                    result.request_id = data.get("id", "")
+                collector.consume(json.loads(event.data))
             except (json.JSONDecodeError, KeyError):
                 pass
-
-        yield (event_bytes, None)
-
-    for raw_item in raw_iter:
-        for raw_line in _iter_lines(raw_item):
-            if isinstance(raw_line, bytes):
-                line_bytes = raw_line
-                line_str = raw_line.decode("utf-8", errors="replace")
-            else:
-                line_str = raw_line
-                line_bytes = raw_line.encode("utf-8")
-
-            stripped = line_str.rstrip("\r\n")
-
-            if not stripped:
-                yield from finalize_event()
-                continue
-
-            if stripped.startswith(":"):
-                yield from finalize_event()
-                yield (
-                    line_bytes
-                    + (b"" if line_bytes.endswith(b"\n") else b"\n"),
-                    None,
-                )
-                continue
-
-            pending_event_lines.append(line_bytes)
-            data = parse_sse_line(stripped)
-            if data is not None:
-                pending_data_lines.append(data)
-
-    yield from finalize_event()
-
-    return result
+        yield event.raw, None
+    return collector.result
